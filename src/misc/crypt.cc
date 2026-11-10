@@ -10,6 +10,8 @@
 #include "alloc.h"
 #include "os.h"
 #include "param/param.h"
+#include "ratls_cert.h"
+#include "ratls_openssl.h"
 #include "socket.h"
 #include <mutex>
 #include <stdio.h>
@@ -17,87 +19,12 @@
 #include <string.h>
 
 #if defined(NCCL_TLS_BACKEND_OPENSSL3)
-#include <openssl/crypto.h>
-#include <openssl/err.h>
-#include <openssl/kdf.h>
-#include <openssl/opensslv.h>
-#include <openssl/params.h>
-#include <openssl/ssl.h>
-
-#if OPENSSL_VERSION_MAJOR != 3
-#error "NCCL TLS support requires OpenSSL 3"
-#endif
 
 static constexpr const char* ncclCryptKdfParamDigest = "digest";
 static constexpr const char* ncclCryptKdfParamKey = "key";
 static constexpr const char* ncclCryptKdfParamInfo = "info";
 
-#define NCCL_CRYPT_CRYPTO_SYMBOLS(SYMBOL) \
-  SYMBOL(BIO_clear_flags) \
-  SYMBOL(BIO_get_data) \
-  SYMBOL(BIO_get_new_index) \
-  SYMBOL(BIO_meth_free) \
-  SYMBOL(BIO_meth_new) \
-  SYMBOL(BIO_meth_set_create) \
-  SYMBOL(BIO_meth_set_ctrl) \
-  SYMBOL(BIO_meth_set_destroy) \
-  SYMBOL(BIO_meth_set_read) \
-  SYMBOL(BIO_meth_set_write) \
-  SYMBOL(BIO_new) \
-  SYMBOL(BIO_set_data) \
-  SYMBOL(BIO_set_flags) \
-  SYMBOL(BIO_set_init) \
-  SYMBOL(CRYPTO_memcmp) \
-  SYMBOL(ERR_clear_error) \
-  SYMBOL(ERR_error_string_n) \
-  SYMBOL(ERR_get_error) \
-  SYMBOL(EVP_KDF_CTX_free) \
-  SYMBOL(EVP_KDF_CTX_new) \
-  SYMBOL(EVP_KDF_derive) \
-  SYMBOL(EVP_KDF_fetch) \
-  SYMBOL(EVP_KDF_free) \
-  SYMBOL(OPENSSL_cleanse) \
-  SYMBOL(OSSL_PARAM_construct_end) \
-  SYMBOL(OSSL_PARAM_construct_octet_string) \
-  SYMBOL(OSSL_PARAM_construct_utf8_string)
-
-#define NCCL_CRYPT_SSL_SYMBOLS(SYMBOL) \
-  SYMBOL(OPENSSL_init_ssl) \
-  SYMBOL(SSL_CIPHER_find) \
-  SYMBOL(SSL_CTX_clear_options) \
-  SYMBOL(SSL_CTX_ctrl) \
-  SYMBOL(SSL_CTX_free) \
-  SYMBOL(SSL_CTX_new) \
-  SYMBOL(SSL_CTX_set_ciphersuites) \
-  SYMBOL(SSL_CTX_set_num_tickets) \
-  SYMBOL(SSL_CTX_set_psk_find_session_callback) \
-  SYMBOL(SSL_CTX_set_psk_use_session_callback) \
-  SYMBOL(SSL_CTX_set_verify) \
-  SYMBOL(SSL_do_handshake) \
-  SYMBOL(SSL_free) \
-  SYMBOL(SSL_get_error) \
-  SYMBOL(SSL_new) \
-  SYMBOL(SSL_read_ex) \
-  SYMBOL(SSL_SESSION_free) \
-  SYMBOL(SSL_SESSION_new) \
-  SYMBOL(SSL_SESSION_set1_master_key) \
-  SYMBOL(SSL_SESSION_set_cipher) \
-  SYMBOL(SSL_SESSION_set_protocol_version) \
-  SYMBOL(SSL_session_reused) \
-  SYMBOL(SSL_set_accept_state) \
-  SYMBOL(SSL_set_bio) \
-  SYMBOL(SSL_set_connect_state) \
-  SYMBOL(SSL_write_ex) \
-  SYMBOL(TLS_method)
-
-struct ncclCryptOpenSslSymbols {
-#define NCCL_CRYPT_DECLARE_SYMBOL(name) decltype(&::name) pfn_##name;
-  NCCL_CRYPT_CRYPTO_SYMBOLS(NCCL_CRYPT_DECLARE_SYMBOL)
-  NCCL_CRYPT_SSL_SYMBOLS(NCCL_CRYPT_DECLARE_SYMBOL)
-#undef NCCL_CRYPT_DECLARE_SYMBOL
-};
-
-static struct ncclCryptOpenSslSymbols ncclCryptOpenSsl;
+struct ncclCryptOpenSslSymbols ncclCryptOpenSsl;
 static ncclOsLibraryHandle ncclCryptCryptoHandle;
 static ncclOsLibraryHandle ncclCryptSslHandle;
 static bool ncclCryptSymbolsReady;
@@ -134,6 +61,19 @@ static size_t ncclCryptConfigKeyLen;
 static int ncclCryptApiMode = NCCL_ENCRYPTION_MODE_NONE;
 static unsigned char* ncclCryptApiPsk;
 static size_t ncclCryptApiPskLen;
+
+// RA-TLS allowlist set through ncclSetEncryption().
+static unsigned char* ncclCryptApiRatlsMrtdAllowlist;
+static size_t ncclCryptApiRatlsMrtdAllowlistLen;
+
+#if defined(NCCL_TLS_BACKEND_OPENSSL3)
+// Process-lifetime RA-TLS certificate and private key.
+static bool ncclCryptRatlsReady = false;
+static unsigned char* ncclCryptRatlsCertDer = nullptr;
+static size_t ncclCryptRatlsCertLen = 0;
+static X509* ncclCryptRatlsCertX509 = nullptr;
+static EVP_PKEY* ncclCryptRatlsPrivKey = nullptr;
+#endif
 
 static void cryptEraseAndFree(unsigned char* key, size_t keyLen) {
   volatile unsigned char* p = key;
@@ -207,9 +147,11 @@ static ncclResult_t cryptLoadOpenSslSymbols() {
 
 #define NCCL_CRYPT_LOAD_CRYPTO_SYMBOL(name) NCCL_CRYPT_LOAD_SYMBOL(ncclCryptCryptoHandle, name)
   NCCL_CRYPT_CRYPTO_SYMBOLS(NCCL_CRYPT_LOAD_CRYPTO_SYMBOL)
+  NCCL_RATLS_CRYPTO_SYMBOLS(NCCL_CRYPT_LOAD_CRYPTO_SYMBOL)
 #undef NCCL_CRYPT_LOAD_CRYPTO_SYMBOL
 #define NCCL_CRYPT_LOAD_SSL_SYMBOL(name) NCCL_CRYPT_LOAD_SYMBOL(ncclCryptSslHandle, name)
   NCCL_CRYPT_SSL_SYMBOLS(NCCL_CRYPT_LOAD_SSL_SYMBOL)
+  NCCL_RATLS_SSL_SYMBOLS(NCCL_CRYPT_LOAD_SSL_SYMBOL)
 #undef NCCL_CRYPT_LOAD_SSL_SYMBOL
 #undef NCCL_CRYPT_LOAD_SYMBOL
 
@@ -380,6 +322,9 @@ fail:
   return ret;
 }
 
+// Forward declaration: defined below after cryptClearMasterKey.
+static void cryptClearRatls();
+
 // Called with ncclCryptLock held.
 static ncclResult_t cryptSetMasterKey(const unsigned char* key, size_t keyLen) {
   NCCLCHECK(cryptInitLib());
@@ -408,6 +353,12 @@ static ncclResult_t cryptSetMasterKey(const unsigned char* key, size_t keyLen) {
   ncclCryptConfigKey = keyCopy;
   ncclCryptConfigKeyLen = keyLen;
   ncclCryptHaveKey = true;
+  // Ensure contexts are in PSK mode (in case RA-TLS was configured earlier).
+  ncclCryptOpenSsl.pfn_SSL_CTX_set_verify(ncclCryptClientCtx, SSL_VERIFY_PEER, nullptr);
+  ncclCryptOpenSsl.pfn_SSL_CTX_set_verify(ncclCryptServerCtx, SSL_VERIFY_NONE, nullptr);
+  ncclCryptOpenSsl.pfn_SSL_CTX_set_psk_use_session_callback(ncclCryptClientCtx, cryptPskUseSession);
+  ncclCryptOpenSsl.pfn_SSL_CTX_set_psk_find_session_callback(ncclCryptServerCtx, cryptPskFindSession);
+  if (ncclCryptRatlsReady) cryptClearRatls();
   return ncclSuccess;
 fail:
   ncclCryptOpenSsl.pfn_EVP_KDF_CTX_free(ctx);
@@ -415,6 +366,53 @@ fail:
   ncclCryptOpenSsl.pfn_OPENSSL_cleanse(ncclCryptPsk, sizeof(ncclCryptPsk));
   cryptEraseAndFree(keyCopy, keyLen);
   ncclCryptHaveKey = false;
+  return ret;
+}
+
+// OpenSSL verify callback for RA-TLS.  The certificates are self-signed, so the
+// only meaningful check is the TDX quote extension.
+static int ratlsVerifyCallback(int preverifyOk, X509_STORE_CTX* ctx) {
+  (void)preverifyOk;
+  int err = ncclCryptOpenSsl.pfn_X509_STORE_CTX_get_error(ctx);
+  // Accept the expected self-signed certificate errors; any other X509 error is fatal.
+  if (err != X509_V_OK && err != X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT &&
+      err != X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN &&
+      err != X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY) {
+    return 0;
+  }
+  X509* cert = ncclCryptOpenSsl.pfn_X509_STORE_CTX_get_current_cert(ctx);
+  return ncclRAtlsVerifyPeerCert(cert, ncclCryptApiRatlsMrtdAllowlist);
+}
+
+// Called with ncclCryptLock held.
+static ncclResult_t cryptSetRatls() {
+  if (ncclCryptRatlsReady) return ncclSuccess;
+  ncclResult_t ret = ncclSuccess;
+  NCCLCHECK(cryptInitLib());
+  NCCLCHECKGOTO(ncclRAtlsGenerateCert(&ncclCryptRatlsCertDer, &ncclCryptRatlsCertLen,
+                                      (void**)&ncclCryptRatlsCertX509,
+                                      (void**)&ncclCryptRatlsPrivKey),
+                ret, fail);
+  if (ncclCryptRatlsCertX509 == nullptr || ncclCryptRatlsPrivKey == nullptr ||
+      ncclCryptOpenSsl.pfn_SSL_CTX_use_certificate(ncclCryptClientCtx, ncclCryptRatlsCertX509) != 1 ||
+      ncclCryptOpenSsl.pfn_SSL_CTX_use_PrivateKey(ncclCryptClientCtx, ncclCryptRatlsPrivKey) != 1 ||
+      ncclCryptOpenSsl.pfn_SSL_CTX_use_certificate(ncclCryptServerCtx, ncclCryptRatlsCertX509) != 1 ||
+      ncclCryptOpenSsl.pfn_SSL_CTX_use_PrivateKey(ncclCryptServerCtx, ncclCryptRatlsPrivKey) != 1) {
+    WARN("ncclCrypt: failed to load RA-TLS certificate into SSL context");
+    ret = ncclSystemError;
+    goto fail;
+  }
+  // Mutual RA-TLS: both sides present and verify the self-signed certificate.
+  ncclCryptOpenSsl.pfn_SSL_CTX_set_verify(ncclCryptClientCtx, SSL_VERIFY_PEER, ratlsVerifyCallback);
+  ncclCryptOpenSsl.pfn_SSL_CTX_set_verify(ncclCryptServerCtx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                                          ratlsVerifyCallback);
+  // PSK callbacks are incompatible with certificate authentication; clear them.
+  ncclCryptOpenSsl.pfn_SSL_CTX_set_psk_use_session_callback(ncclCryptClientCtx, nullptr);
+  ncclCryptOpenSsl.pfn_SSL_CTX_set_psk_find_session_callback(ncclCryptServerCtx, nullptr);
+  ncclCryptRatlsReady = true;
+  return ncclSuccess;
+fail:
+  cryptClearRatls();
   return ret;
 }
 #else
@@ -435,6 +433,21 @@ static void cryptClearMasterKey() {
   ncclCryptHaveKey = false;
 }
 
+#if defined(NCCL_TLS_BACKEND_OPENSSL3)
+// Called with ncclCryptLock held.
+static void cryptClearRatls() {
+  ncclCryptOpenSsl.pfn_X509_free(ncclCryptRatlsCertX509);
+  ncclCryptOpenSsl.pfn_EVP_PKEY_free(ncclCryptRatlsPrivKey);
+  ncclCryptRatlsCertX509 = nullptr;
+  ncclCryptRatlsPrivKey = nullptr;
+  ncclCryptOpenSsl.pfn_OPENSSL_cleanse(ncclCryptRatlsCertDer, ncclCryptRatlsCertLen);
+  free(ncclCryptRatlsCertDer);
+  ncclCryptRatlsCertDer = nullptr;
+  ncclCryptRatlsCertLen = 0;
+  ncclCryptRatlsReady = false;
+}
+#endif
+
 ncclResult_t ncclGetCryptConnectionMode(bool* encrypted) {
   *encrypted = false;
 
@@ -447,6 +460,17 @@ ncclResult_t ncclGetCryptConnectionMode(bool* encrypted) {
     key = ncclCryptApiPsk;
     keyLen = ncclCryptApiPskLen;
     break;
+  case NCCL_ENCRYPTION_MODE_RATLS:
+#if defined(NCCL_TLS_BACKEND_OPENSSL3)
+    if (!ncclCryptRatlsReady) {
+      NCCLCHECK(cryptSetRatls());
+    }
+    *encrypted = true;
+#else
+    WARN("ncclGetCryptConnectionMode: RA-TLS requested but NCCL was built without TLS support");
+    return ncclInvalidUsage;
+#endif
+    return ncclSuccess;
   case NCCL_ENCRYPTION_MODE_NONE:
     break;
   default:
@@ -479,6 +503,7 @@ ncclResult_t ncclSetEncryption(const ncclEncryptionConfig_t* config) {
   }
   // checks for config mode
   size_t pskLen = 0;
+  size_t ratlsMrtdLen = 0;
   switch (internal.mode) {
   case NCCL_ENCRYPTION_MODE_NONE:
     break;
@@ -493,6 +518,16 @@ ncclResult_t ncclSetEncryption(const ncclEncryptionConfig_t* config) {
       return ncclInvalidArgument;
     }
     break;
+  case NCCL_ENCRYPTION_MODE_RATLS:
+    if (internal.ratlsMrtdAllowlist != NCCL_CONFIG_UNDEF_PTR) {
+      ratlsMrtdLen = internal.ratlsMrtdAllowlistLen;
+      if (ratlsMrtdLen != NCCL_RATLS_TDX_MRTD_BYTES) {
+        WARN("ncclSetEncryption: config->ratlsMrtdAllowlistLen must be %d when an allowlist is provided",
+             NCCL_RATLS_TDX_MRTD_BYTES);
+        return ncclInvalidArgument;
+      }
+    }
+    break;
   default:
     WARN("ncclSetEncryption: config->mode=%d is not a supported encryption mode", internal.mode);
     return ncclInvalidArgument;
@@ -500,7 +535,6 @@ ncclResult_t ncclSetEncryption(const ncclEncryptionConfig_t* config) {
 
   std::lock_guard<std::mutex> lock(ncclCryptLock);
 
-  // Case 1: store the API PSK; ncclGetCryptConnectionMode() installs the derived key later
   if (internal.mode == NCCL_ENCRYPTION_MODE_PSK) {
     unsigned char* keyCopy = nullptr;
     NCCLCHECK(ncclCalloc(&keyCopy, pskLen));
@@ -508,12 +542,38 @@ ncclResult_t ncclSetEncryption(const ncclEncryptionConfig_t* config) {
     cryptEraseAndFree(ncclCryptApiPsk, ncclCryptApiPskLen);
     ncclCryptApiPsk = keyCopy;
     ncclCryptApiPskLen = pskLen;
-  } else {
-    // Case 2: default or non-PSK/plaintext mode, clear installed master key
+    cryptEraseAndFree(ncclCryptApiRatlsMrtdAllowlist, ncclCryptApiRatlsMrtdAllowlistLen);
+    ncclCryptApiRatlsMrtdAllowlist = nullptr;
+    ncclCryptApiRatlsMrtdAllowlistLen = 0;
+#if defined(NCCL_TLS_BACKEND_OPENSSL3)
+    if (ncclCryptRatlsReady) cryptClearRatls();
+#endif
+    if (ncclCryptHaveKey || ncclCryptConfigKey != nullptr) cryptClearMasterKey();
+  } else if (internal.mode == NCCL_ENCRYPTION_MODE_RATLS) {
+    unsigned char* mrtdCopy = nullptr;
+    if (ratlsMrtdLen != 0) {
+      NCCLCHECK(ncclCalloc(&mrtdCopy, ratlsMrtdLen));
+      memcpy(mrtdCopy, internal.ratlsMrtdAllowlist, ratlsMrtdLen);
+    }
+    cryptEraseAndFree(ncclCryptApiRatlsMrtdAllowlist, ncclCryptApiRatlsMrtdAllowlistLen);
+    ncclCryptApiRatlsMrtdAllowlist = mrtdCopy;
+    ncclCryptApiRatlsMrtdAllowlistLen = ratlsMrtdLen;
     cryptEraseAndFree(ncclCryptApiPsk, ncclCryptApiPskLen);
     ncclCryptApiPsk = nullptr;
     ncclCryptApiPskLen = 0;
     if (ncclCryptHaveKey || ncclCryptConfigKey != nullptr) cryptClearMasterKey();
+  } else {
+    // Plaintext: clear all key material.
+    cryptEraseAndFree(ncclCryptApiPsk, ncclCryptApiPskLen);
+    ncclCryptApiPsk = nullptr;
+    ncclCryptApiPskLen = 0;
+    cryptEraseAndFree(ncclCryptApiRatlsMrtdAllowlist, ncclCryptApiRatlsMrtdAllowlistLen);
+    ncclCryptApiRatlsMrtdAllowlist = nullptr;
+    ncclCryptApiRatlsMrtdAllowlistLen = 0;
+    if (ncclCryptHaveKey || ncclCryptConfigKey != nullptr) cryptClearMasterKey();
+#if defined(NCCL_TLS_BACKEND_OPENSSL3)
+    if (ncclCryptRatlsReady) cryptClearRatls();
+#endif
   }
   ncclCryptApiMode = internal.mode;
   return ncclSuccess;
@@ -577,7 +637,9 @@ static ncclResult_t cryptHandshakeStep(struct ncclSocket* sock, bool* done) {
     // The client also offers a certificate handshake, so a server that ignored the PSK could otherwise
     // complete one (the client's SSL_VERIFY_PEER, set in cryptInitLib, independently refuses any
     // certificate). On both roles, only a handshake that used the PSK proves the peer holds the key.
-    if (ncclCryptOpenSsl.pfn_SSL_session_reused(sock->crypto->ssl) != 1) {
+    // RA-TLS uses certificate authentication instead; the verify callback already checked the quote.
+    if (ncclCryptApiMode != NCCL_ENCRYPTION_MODE_RATLS &&
+        ncclCryptOpenSsl.pfn_SSL_session_reused(sock->crypto->ssl) != 1) {
       char line[SOCKET_NAME_MAXLEN + 1];
       WARN("ncclCrypt: TLS handshake with %s did not use the pre-shared key; rejecting peer",
            ncclSocketToString(&sock->addr, line));

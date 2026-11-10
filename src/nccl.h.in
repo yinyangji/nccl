@@ -898,7 +898,8 @@ ncclResult_t pncclGroupSimulateEnd(ncclSimInfo_t* simInfo);
  */
 typedef enum {
   NCCL_ENCRYPTION_MODE_NONE = 0,                        // plaintext
-  NCCL_ENCRYPTION_MODE_PSK = 1                          // PSK is set
+  NCCL_ENCRYPTION_MODE_PSK = 1,                         // PSK is set
+  NCCL_ENCRYPTION_MODE_RATLS = 2                        // Remote Attestation TLS (TDX)
 } ncclEncryptionMode_t;
 
 typedef struct ncclEncryptionConfig_v23200 {
@@ -909,6 +910,9 @@ typedef struct ncclEncryptionConfig_v23200 {
   /* attributes that users are able to customize. */
   int mode;
   const char* psk;
+  /* RA-TLS attributes (used when mode == NCCL_ENCRYPTION_MODE_RATLS). */
+  const unsigned char* ratlsMrtdAllowlist;                // allowed TDX MRTD measurement; nullptr accepts any
+  size_t ratlsMrtdAllowlistLen;                           // must be 48 when ratlsMrtdAllowlist is non-nullptr
 } ncclEncryptionConfig_t;
 
 #define NCCL_ENCRYPTION_CONFIG_INITIALIZER {                            \
@@ -917,6 +921,8 @@ typedef struct ncclEncryptionConfig_v23200 {
   NCCL_VERSION_CODE,                        /* version */               \
   NCCL_ENCRYPTION_MODE_NONE,                /* encryption mode */       \
   NCCL_CONFIG_UNDEF_PTR,                    /* tls psk */               \
+  NCCL_CONFIG_UNDEF_PTR,                    /* ra-tls mrtd allowlist */ \
+  0,                                        /* ra-tls allowlist length */ \
 }
 
 ncclResult_t  ncclSetEncryption(const ncclEncryptionConfig_t* config);
